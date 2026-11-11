@@ -11,13 +11,12 @@ here, every application is an image that its CI pipeline publishes to GHCR.
 
 | Path | What it is |
 |---|---|
-| `docker-compose.yml` | The whole system: the API Gateway, the Authentication Service, the User Service, their two PostgreSQL databases and Redis |
+| `docker-compose.yml` | The whole system: the API Gateway, the Authentication Service, the User Service, the Order Service, their three PostgreSQL databases and Redis |
 | `.env.example` | The variables of the Compose file with placeholders; copy it to `.env` |
 | `.github/workflows/ci.yml` | Validates the Compose file on every push and pull request |
 | `k8s/` | The Kubernetes manifests (not there yet: the Kubernetes task) |
 
-The Order Service, the Payment Service, MongoDB and Kafka are added with the tasks of those
-services.
+The Payment Service, MongoDB and Kafka are added with the tasks of those services.
 
 ## Services
 
@@ -26,8 +25,10 @@ services.
 | API Gateway | `api-gateway` | 8080 | `backend` | yes |
 | Authentication Service | `authentication-service` | 8081 | `backend`, `data` | no |
 | User Service | `user-service` | 8082 | `backend`, `data` | no |
+| Order Service | `order-service` | 8083 | `backend`, `data` | no |
 | PostgreSQL of the Authentication Service | `auth-postgres` | 5432 | `data` | no |
 | PostgreSQL of the User Service | `user-postgres` | 5432 | `data` | no |
+| PostgreSQL of the Order Service | `order-postgres` | 5432 | `data` | no |
 | Redis (cache of the User Service) | `redis` | 6379 | `data` | no |
 
 Images (all from GHCR, tag `latest` by default):
@@ -37,6 +38,7 @@ Images (all from GHCR, tag `latest` by default):
 | `API_GATEWAY_IMAGE` | `ghcr.io/arsshark/apigateway:latest` |
 | `AUTH_SERVICE_IMAGE` | `ghcr.io/arsshark/authenticationservice:latest` |
 | `USER_SERVICE_IMAGE` | `ghcr.io/arsshark/userservice:latest` |
+| `ORDER_SERVICE_IMAGE` | `ghcr.io/arsshark/orderservice:latest` |
 
 ## Networks
 
@@ -47,8 +49,9 @@ Images (all from GHCR, tag `latest` by default):
 
 - Every request from outside enters through the Gateway (`localhost:8080`) and goes to a service by
   its Compose name over `backend`: the routes, the key set of the Authentication Service (read by the
-  Gateway and the User Service), and the call of the Authentication Service to the User Service
-  during a registration.
+  Gateway, the User Service and the Order Service), the call of the Authentication Service to the
+  User Service during a registration, and the call of the Order Service to the User Service for
+  the owner of an order.
 - A service reaches its database or Redis over `data`. The network is internal: it has no route to
   the outside, and a port of a container that sits only in it cannot be published. The Gateway is
   not in it.
@@ -62,7 +65,7 @@ not commit it.
 
 Requirements: Docker with Docker Compose v2.
 
-1. Copy `.env.example` to `.env` and set the values: the two database passwords, the internal key,
+1. Copy `.env.example` to `.env` and set the values: the three database passwords, the internal key,
    the signing key of the tokens and the first admin (`ADMIN_LOGIN` is an email). The comments in
    the file say what each value is. `.env` is ignored by Git: never commit it.
 
@@ -108,9 +111,9 @@ Requirements: Docker with Docker Compose v2.
    `docker compose down -v` deletes it.
 
 A password of a database is read by PostgreSQL only when its volume is empty: after changing it, run
-`docker compose down -v`. The same `INTERNAL_API_KEY` must reach the Authentication Service and the
-User Service, and the same `JWT_ISSUER` all three applications; the Compose file passes one value to
-each.
+`docker compose down -v`. The same `INTERNAL_API_KEY` must reach the Authentication Service, the
+User Service and the Order Service (it sends the key, the User Service checks it), and the same
+`JWT_ISSUER` all four applications; the Compose file passes one value to each.
 
 ### Run images that you built yourself
 
@@ -121,16 +124,16 @@ Build an image in the repository of its service and set its name in `.env`:
 | ApiGateway | `docker build -t api-gateway:dev .` | `API_GATEWAY_IMAGE=api-gateway:dev` |
 | AuthenticationService | `docker build -t authentication-service:dev .` | `AUTH_SERVICE_IMAGE=authentication-service:dev` |
 | UserService | `docker build -t user-service:dev .` | `USER_SERVICE_IMAGE=user-service:dev` |
+| OrderService | `docker build -t order-service:dev .` | `ORDER_SERVICE_IMAGE=order-service:dev` |
 
 Then run `docker compose up` and do not run `docker compose pull`: the pull fails for an image that
 is not in a registry. Compose pulls an image only when it is missing locally, so an old `latest`
 that is already on the machine is used without a message: run `docker compose pull` (with the
 default names) to refresh it.
 
-Until the pull requests of the review fixes of the three services are merged and published, the
-images on GHCR are the old ones: the registration, the claim `user_id` and the internal endpoints of
-the User Service differ. Build the three images from the branches `fix/review-apigateway`,
-`fix/review-authservice` and `feature/JACAG-14-user-by-email` and set the three variables.
+The images on GHCR are built from `main` of each repository after a merge. A change that is merged
+but not published yet (see the tab Actions of that repository) is missing from `latest`: build the
+image from the branch, as above, until the publication is done.
 
 ## Postman
 
@@ -147,6 +150,7 @@ system as above, then follow the section "Postman" of the README of that reposit
 | the Authentication Service stops with `JWT_PRIVATE_KEY is not valid base64 on one line` | the placeholder of `.env.example` is still there: generate a key |
 | login says 401 for the admin | `ADMIN_LOGIN` and `ADMIN_PASSWORD` were changed after the first start: the admin is created only when the login does not exist yet |
 | every token is 401 and the log has `A token could not be verified` | the key set of the Authentication Service cannot be read: the service is not running or is not in the `backend` network |
+| an order has `user: null` and `userInfoAvailable: false` | the Order Service cannot ask the User Service: it is not running, or `INTERNAL_API_KEY` differs between them (the User Service answers 401), or the User Service image has no `GET /internal/users/by-email` yet |
 | a service cannot reach its database | the service is not in the `data` network, or the database is still starting (`docker compose ps` shows its health) |
 | `curl` cannot connect to `127.0.0.1` on a proxy port | an `http_proxy` variable is set: use `curl.exe --noproxy "*"` |
 
@@ -168,8 +172,9 @@ Each service task adds its own part here, in its own pull request (`feature/JACA
 2. Networks: `backend` for every application; `data` too when it owns a database, a cache or a
    broker. A database or a broker is in `data` only.
 3. The variables in `.env.example` with placeholders and a comment.
-4. The Gateway needs the address of the new service (for example `ORDER_SERVICE_URI`) only when the
-   `docker` profile default of the Gateway is not right.
+4. The Gateway needs the address of the new service (for example `PAYMENT_SERVICE_URI`) only when the
+   `docker` profile default of the Gateway is not right. It also needs the route and the security
+   rule of the new paths: that is a pull request of the ApiGateway repository.
 5. The tables of this README.
 
 ## Known limits
