@@ -1,12 +1,12 @@
-# The whole system: the API Gateway, the Authentication Service, the User Service, their two
-# PostgreSQL databases and Redis. The Order and Payment services, MongoDB and Kafka are added in
-# the tasks of those services.
+# The whole system: the API Gateway, the Authentication Service, the User Service, the Order
+# Service, their three PostgreSQL databases and Redis. The Payment Service, MongoDB and Kafka are
+# added in the tasks of those services.
 #
 # Usage: copy .env.example to .env, set the passwords and the keys, then run
 #   docker compose up
 # Every application is an image that the CI pipeline of its repository publishes to GHCR (see
-# API_GATEWAY_IMAGE, AUTH_SERVICE_IMAGE and USER_SERVICE_IMAGE in .env.example to use images that
-# you built yourself). Nothing is built here.
+# API_GATEWAY_IMAGE, AUTH_SERVICE_IMAGE, USER_SERVICE_IMAGE and ORDER_SERVICE_IMAGE in
+# .env.example to use images that you built yourself). Nothing is built here.
 #
 # Two networks make the isolation visible:
 #   backend  the applications. The Gateway is the only container with a published port (8080):
@@ -24,6 +24,8 @@ services:
       authentication-service:
         condition: service_started
       user-service:
+        condition: service_started
+      order-service:
         condition: service_started
     environment:
       # The "docker" profile holds the addresses of the services: the service names below, and the
@@ -131,6 +133,50 @@ services:
     networks:
       - data
 
+  order-service:
+    image: ${ORDER_SERVICE_IMAGE:-ghcr.io/arsshark/orderservice:latest}
+    depends_on:
+      # Only the database is awaited. The key set of the Authentication Service is read with the
+      # first token and the User Service is asked for the owner of an order (with a circuit
+      # breaker: an order is returned without the owner data when it cannot answer), so neither
+      # has to be up when this service starts.
+      order-postgres:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: order-postgres
+      DB_NAME: ${ORDER_DB_NAME:-order_service_db}
+      DB_USERNAME: ${ORDER_DB_USERNAME:?ORDER_DB_USERNAME is required, see .env.example}
+      DB_PASSWORD: ${ORDER_DB_PASSWORD:?ORDER_DB_PASSWORD is required, see .env.example}
+      # The Order Service has no internal endpoints: it only SENDS this key to the User Service
+      # (the lookup of the owner of an order), so the value must be the same as there.
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY is required, see .env.example}
+      # The internal addresses of the other services: their service names, never the Gateway.
+      AUTH_JWKS_URI: http://authentication-service:8081/.well-known/jwks.json
+      USER_SERVICE_URI: http://user-service:8082
+      JWT_ISSUER: ${JWT_ISSUER:-authentication-service}
+    volumes:
+      - order-logs:/app/logs
+    networks:
+      - backend
+      - data
+
+  order-postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ${ORDER_DB_NAME:-order_service_db}
+      POSTGRES_USER: ${ORDER_DB_USERNAME:?ORDER_DB_USERNAME is required, see .env.example}
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD:?ORDER_DB_PASSWORD is required, see .env.example}
+    volumes:
+      - order-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - data
+
   redis:
     image: redis:7
     # The cache of the User Service is disposable: no snapshots, no append-only file.
@@ -156,5 +202,7 @@ volumes:
   gateway-logs:
   auth-logs:
   user-logs:
+  order-logs:
   auth-postgres-data:
   user-postgres-data:
+  order-postgres-data:
