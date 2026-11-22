@@ -1,6 +1,6 @@
 # The whole system: the API Gateway, the Authentication Service, the User Service, the Order
-# Service, their three PostgreSQL databases and Redis. The Payment Service, MongoDB and Kafka are
-# added in the tasks of those services.
+# Service, their three PostgreSQL databases, Redis and a Kafka broker. The Payment Service and its
+# MongoDB are added in the task of that service.
 #
 # Usage: copy .env.example to .env, set the passwords and the keys, then run
 #   docker compose up
@@ -11,8 +11,9 @@
 # Two networks make the isolation visible:
 #   backend  the applications. The Gateway is the only container with a published port (8080):
 #            it is the one entry point of the system.
-#   data     the databases and Redis. The network is internal: it has no route to the outside and
-#            no port of it can be published. Only the applications that own a database are in it.
+#   data     the databases, Redis and the Kafka broker. The network is internal: it has no route
+#            to the outside and no port of it can be published. Only the applications that own a
+#            database or use the broker are in it.
 name: e-commerce
 
 services:
@@ -136,11 +137,14 @@ services:
   order-service:
     image: ${ORDER_SERVICE_IMAGE:-ghcr.io/arsshark/orderservice:latest}
     depends_on:
-      # Only the database is awaited. The key set of the Authentication Service is read with the
-      # first token and the User Service is asked for the owner of an order (with a circuit
-      # breaker: an order is returned without the owner data when it cannot answer), so neither
-      # has to be up when this service starts.
+      # The database and the broker are awaited: the application connects to both when it
+      # starts. The key set of the Authentication Service is read with the first token and the
+      # User Service is asked for the owner of an order (with a circuit breaker: an order is
+      # returned without the owner data when it cannot answer), so neither has to be up when this
+      # service starts.
       order-postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     environment:
       SPRING_PROFILES_ACTIVE: docker
@@ -155,6 +159,8 @@ services:
       AUTH_JWKS_URI: http://authentication-service:8081/.well-known/jwks.json
       USER_SERVICE_URI: http://user-service:8082
       JWT_ISSUER: ${JWT_ISSUER:-authentication-service}
+      # The broker of the system: the Order Service reads the payment events from it.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
     volumes:
       - order-logs:/app/logs
     networks:
@@ -189,13 +195,53 @@ services:
     networks:
       - data
 
+  kafka:
+    # One broker in KRaft mode: this single process is both the broker and the controller, there
+    # is no ZooKeeper. It is the same image and settings as in the Compose files of the Order
+    # Service and the Payment Service: one listener, for the containers of this project, and no
+    # published port. The image reads every KAFKA_* variable into its configuration and a
+    # variable replaces the default, so the set below is complete on purpose. The topics are
+    # declared by the applications (Payment: payment-events; Order: payment-events and its
+    # dead letter topic), and a topic is never created by a typo in its name.
+    image: apache/kafka:4.2.0
+    environment:
+      KAFKA_NODE_ID: 1
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:9093,INTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # One broker cannot keep more than one copy of anything, so the internal topics of Kafka
+      # (consumer offsets, transactions) must have one replica, or the broker does not start.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    # No volume: the data of a development broker is disposable (the applications declare their
+    # topics again when they start). "docker compose down" resets it.
+    healthcheck:
+      # The string form of "test" runs in the shell of the container. The tool exits with an
+      # error while the broker does not answer.
+      test: /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - data
+
 networks:
   backend:
     driver: bridge
   data:
     driver: bridge
     # No route to the outside and no published ports: only the applications of the
-    # "backend" network that also joined "data" can reach the databases and Redis.
+    # "backend" network that also joined "data" can reach the databases, Redis and Kafka.
     internal: true
 
 volumes:
