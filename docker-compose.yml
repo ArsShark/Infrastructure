@@ -30,6 +30,8 @@ services:
         condition: service_started
       order-service:
         condition: service_started
+      payment-service:
+        condition: service_started
     environment:
       # The "docker" profile holds the addresses of the services: the service names below, and the
       # key set at http://authentication-service:8081/.well-known/jwks.json.
