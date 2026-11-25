@@ -16,9 +16,10 @@ here, every application is an image that its CI pipeline publishes to GHCR.
 | `.github/workflows/ci.yml` | Validates the Compose file on every push and pull request |
 | `k8s/` | The Kubernetes manifests (not there yet: the Kubernetes task) |
 
-The Gateway does not route `/api/payments/**` yet (that is a pull request of the ApiGateway
-repository), so the Payment Service runs and takes part in the system, but a client cannot reach
-it through `localhost:8080` until then.
+The Gateway routes `/api/payments/**` to the Payment Service (the ApiGateway pull request
+`feature/payment-gateway-routes`). The image `latest` of the Gateway on GHCR has that route only
+after the pull request is merged and the image is published; until then build the Gateway locally
+(see "Run images that you built yourself").
 
 ## Services
 
@@ -212,7 +213,6 @@ Each service task adds its own part here, in its own pull request (`feature/JACA
   only the ones that use them.
 - The Payment Service needs the internet for the random number service (random.org by default).
   Without it every payment is a 502 and nothing is saved.
-- The Gateway does not route the Payment Service yet (see above).
 
 ## CI pipeline
 
