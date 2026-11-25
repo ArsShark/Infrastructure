@@ -1,18 +1,21 @@
 # The whole system: the API Gateway, the Authentication Service, the User Service, the Order
-# Service, their three PostgreSQL databases and Redis. The Payment Service, MongoDB and Kafka are
-# added in the tasks of those services.
+# Service and the Payment Service, their three PostgreSQL databases, MongoDB, Redis and a Kafka
+# broker.
 #
 # Usage: copy .env.example to .env, set the passwords and the keys, then run
 #   docker compose up
 # Every application is an image that the CI pipeline of its repository publishes to GHCR (see
-# API_GATEWAY_IMAGE, AUTH_SERVICE_IMAGE, USER_SERVICE_IMAGE and ORDER_SERVICE_IMAGE in
-# .env.example to use images that you built yourself). Nothing is built here.
+# API_GATEWAY_IMAGE, AUTH_SERVICE_IMAGE, USER_SERVICE_IMAGE, ORDER_SERVICE_IMAGE and
+# PAYMENT_SERVICE_IMAGE in .env.example to use images that you built yourself). Nothing is built
+# here.
 #
 # Two networks make the isolation visible:
 #   backend  the applications. The Gateway is the only container with a published port (8080):
-#            it is the one entry point of the system.
-#   data     the databases and Redis. The network is internal: it has no route to the outside and
-#            no port of it can be published. Only the applications that own a database are in it.
+#            it is the one entry point of the system. It is the network with a route to the
+#            outside, which the Payment Service needs for the random number service.
+#   data     the databases, MongoDB, Redis and the Kafka broker. The network is internal: it has no route
+#            to the outside and no port of it can be published. Only the applications that own a
+#            database or use the broker are in it.
 name: e-commerce
 
 services:
@@ -26,6 +29,8 @@ services:
       user-service:
         condition: service_started
       order-service:
+        condition: service_started
+      payment-service:
         condition: service_started
     environment:
       # The "docker" profile holds the addresses of the services: the service names below, and the
@@ -136,11 +141,14 @@ services:
   order-service:
     image: ${ORDER_SERVICE_IMAGE:-ghcr.io/arsshark/orderservice:latest}
     depends_on:
-      # Only the database is awaited. The key set of the Authentication Service is read with the
-      # first token and the User Service is asked for the owner of an order (with a circuit
-      # breaker: an order is returned without the owner data when it cannot answer), so neither
-      # has to be up when this service starts.
+      # The database and the broker are awaited: the application connects to both when it
+      # starts. The key set of the Authentication Service is read with the first token and the
+      # User Service is asked for the owner of an order (with a circuit breaker: an order is
+      # returned without the owner data when it cannot answer), so neither has to be up when this
+      # service starts.
       order-postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     environment:
       SPRING_PROFILES_ACTIVE: docker
@@ -155,6 +163,8 @@ services:
       AUTH_JWKS_URI: http://authentication-service:8081/.well-known/jwks.json
       USER_SERVICE_URI: http://user-service:8082
       JWT_ISSUER: ${JWT_ISSUER:-authentication-service}
+      # The broker of the system: the Order Service reads the payment events from it.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
     volumes:
       - order-logs:/app/logs
     networks:
@@ -177,6 +187,76 @@ services:
     networks:
       - data
 
+  payment-service:
+    image: ${PAYMENT_SERVICE_IMAGE:-ghcr.io/arsshark/paymentservice:latest}
+    depends_on:
+      # The database and the broker are awaited: the application applies its changelog and
+      # declares its topic when it starts. The key set of the Authentication Service is read with
+      # the first token, so it has not to be up.
+      payment-mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # The "docker" profile defaults to the host "mongodb"; this system names it by the service.
+      MONGO_HOST: payment-mongodb
+      MONGO_DB: ${PAYMENT_DB_NAME:-payment_service_db}
+      # The user of the application (created by the script of payment-mongodb, not the
+      # administrator).
+      MONGO_USERNAME: ${PAYMENT_DB_USERNAME:?PAYMENT_DB_USERNAME is required, see .env.example}
+      MONGO_PASSWORD: ${PAYMENT_DB_PASSWORD:?PAYMENT_DB_PASSWORD is required, see .env.example}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      # The key set of the Authentication Service: its service name, never the Gateway. The
+      # Payment Service has no internal endpoints and sends no internal key.
+      AUTH_JWKS_URI: http://authentication-service:8081/.well-known/jwks.json
+      JWT_ISSUER: ${JWT_ISSUER:-authentication-service}
+      # The random number service on the internet. It is why this service is in "backend": that
+      # network has a route out, "data" has not.
+      RANDOM_API_URI: ${RANDOM_API_URI:-https://www.random.org}
+    volumes:
+      - payment-logs:/app/logs
+    networks:
+      - backend
+      - data
+
+  payment-mongodb:
+    image: mongo:8
+    environment:
+      # The administrator. The image creates it on the first start (the data volume must be
+      # empty). The application does not use it.
+      MONGO_INITDB_ROOT_USERNAME: ${PAYMENT_DB_ROOT_USERNAME:?PAYMENT_DB_ROOT_USERNAME is required, see .env.example}
+      MONGO_INITDB_ROOT_PASSWORD: ${PAYMENT_DB_ROOT_PASSWORD:?PAYMENT_DB_ROOT_PASSWORD is required, see .env.example}
+      # The user of the application, created by the script below on the same first start, with
+      # a role of readWrite plus collMod on the one database of the application, and nothing
+      # else.
+      MONGO_APP_USERNAME: ${PAYMENT_DB_USERNAME:?PAYMENT_DB_USERNAME is required, see .env.example}
+      MONGO_APP_PASSWORD: ${PAYMENT_DB_PASSWORD:?PAYMENT_DB_PASSWORD is required, see .env.example}
+      MONGO_APP_DATABASE: ${PAYMENT_DB_NAME:-payment_service_db}
+    volumes:
+      - payment-mongo-data:/data/db
+    configs:
+      # The image runs every script of this directory once, on the first start of an empty volume.
+      # An inline config and not a mounted file on purpose: a bind mount needs the drive of the
+      # project to be visible to the Docker daemon, which is not always so (a USB drive with
+      # Docker Desktop on Windows: the container gets an empty directory instead of the file and
+      # the image stops with EISDIR). See the config at the end of this file.
+      - source: payment_mongo_init_script
+        target: /docker-entrypoint-initdb.d/01-create-app-user.js
+        mode: 0444
+    healthcheck:
+      # Logs in as the USER OF THE APPLICATION, so it passes only after the script has created
+      # it (the administrator exists earlier, and the temporary server of the first start would
+      # answer before the script has run). A failed login makes mongosh exit with an error. "$$"
+      # keeps Compose from interpolating the variables: the shell of the container does.
+      test: mongosh --quiet -u "$$MONGO_APP_USERNAME" -p "$$MONGO_APP_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand('ping')"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - data
+
   redis:
     image: redis:7
     # The cache of the User Service is disposable: no snapshots, no append-only file.
@@ -189,13 +269,53 @@ services:
     networks:
       - data
 
+  kafka:
+    # One broker in KRaft mode: this single process is both the broker and the controller, there
+    # is no ZooKeeper. It is the same image and settings as in the Compose files of the Order
+    # Service and the Payment Service: one listener, for the containers of this project, and no
+    # published port. The image reads every KAFKA_* variable into its configuration and a
+    # variable replaces the default, so the set below is complete on purpose. The topics are
+    # declared by the applications (Payment: payment-events; Order: payment-events and its
+    # dead letter topic), and a topic is never created by a typo in its name.
+    image: apache/kafka:4.2.0
+    environment:
+      KAFKA_NODE_ID: 1
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:9093,INTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # One broker cannot keep more than one copy of anything, so the internal topics of Kafka
+      # (consumer offsets, transactions) must have one replica, or the broker does not start.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    # No volume: the data of a development broker is disposable (the applications declare their
+    # topics again when they start). "docker compose down" resets it.
+    healthcheck:
+      # The string form of "test" runs in the shell of the container. The tool exits with an
+      # error while the broker does not answer.
+      test: /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - data
+
 networks:
   backend:
     driver: bridge
   data:
     driver: bridge
     # No route to the outside and no published ports: only the applications of the
-    # "backend" network that also joined "data" can reach the databases and Redis.
+    # "backend" network that also joined "data" can reach the databases, Redis and Kafka.
     internal: true
 
 volumes:
@@ -203,6 +323,62 @@ volumes:
   auth-logs:
   user-logs:
   order-logs:
+  payment-logs:
   auth-postgres-data:
   user-postgres-data:
   order-postgres-data:
+  payment-mongo-data:
+
+# The script that creates the MongoDB user of the Payment Service on the first start. It is a copy
+# of docker/mongodb/01-create-app-user.js of the PaymentService repository, which is the source:
+# change it there first (its tests check it) and copy it here, indented by 6 spaces. Compose
+# interpolates variables in the text of an inline config, so the script must have no dollar sign.
+configs:
+  payment_mongo_init_script:
+    content: |
+      // Runs ONCE, on the first start of the MongoDB container (an empty data volume), as a script of
+      // /docker-entrypoint-initdb.d. The image has already created the administrator from
+      // MONGO_INITDB_ROOT_USERNAME and MONGO_INITDB_ROOT_PASSWORD. This script creates the user of the
+      // application with the least privilege that it needs, on ONE database:
+      //   - the built-in role readWrite: create the collection and its indexes (the Liquibase changelog
+      //     does) and read and write documents;
+      //   - the one action collMod on top of it. Liquibase itself needs it: it applies a validator to
+      //     its own history collection, DATABASECHANGELOG, and readWrite does not include collMod (it
+      //     belongs to dbAdmin, which also allows dropping the database).
+      // The user cannot create users, drop the database or touch another database.
+      //
+      // The role and the user are created in the database "admin", so the authentication database stays
+      // "admin", the default of the application; their rights are on the database of the application.
+      //
+      // The values come from the environment of the container, not from the text of the script, so a
+      // password with quotes, dollar signs or backslashes needs no escaping.
+      //
+      // This file has no dollar sign at all, on purpose: docker-compose.yml holds a copy of this text
+      // as an inline config (a bind mount of this file does not work on a drive that Docker Desktop
+      // cannot see), and Compose treats a dollar sign in that text as a variable to interpolate.
+      // DockerComposeFilesTest checks both the copy and the absence of the sign.
+      const environment = process.env;
+      const username = environment.MONGO_APP_USERNAME;
+      const password = environment.MONGO_APP_PASSWORD;
+      const database = environment.MONGO_APP_DATABASE;
+
+      if (!username || !password || !database) {
+        throw new Error('MONGO_APP_USERNAME, MONGO_APP_PASSWORD and MONGO_APP_DATABASE must be set');
+      }
+
+      const admin = db.getSiblingDB('admin');
+      // The entrypoint runs the script as the administrator; the explicit login does not depend on it.
+      admin.auth(environment.MONGO_INITDB_ROOT_USERNAME, environment.MONGO_INITDB_ROOT_PASSWORD);
+
+      const roleName = [database, 'app'].join('_');
+      admin.createRole({
+        role: roleName,
+        privileges: [{ resource: { db: database, collection: '' }, actions: ['collMod'] }],
+        roles: [{ role: 'readWrite', db: database }]
+      });
+      admin.createUser({
+        user: username,
+        pwd: password,
+        roles: [{ role: roleName, db: 'admin' }]
+      });
+      print('Created the user', username, 'with the role', roleName, 'on', database);
